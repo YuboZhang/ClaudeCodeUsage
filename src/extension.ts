@@ -1,5 +1,10 @@
 import * as fs from 'fs';
+import * as https from 'https';
 import * as path from 'path';
+import * as os from 'os';
+import { renderHeatmapSvg } from './heatmapSvg';
+import { DEFAULT_SECTIONS, ShareRange, buildShareCardData, shareCardFilename } from './shareCard';
+import { renderShareCardSvg } from './shareCardSvg';
 import * as vscode from 'vscode';
 import { ClaudeDataLoader } from './dataLoader';
 import { StatusBarManager } from './statusBar';
@@ -17,6 +22,21 @@ import { buildAdviceSummary } from './adviceSummary';
 import { getDemoBody } from './adviceDemoSample';
 import { ClaudeApiUsageResponse, ContentAnalysis, ExtensionConfig } from './types';
 import { SettingsStore } from './settings';
+
+// One-line "what's new" per major.minor, shown once after an upgrade (see
+// maybeAnnounceWhatsNew) so users discover new — including opt-in — features.
+// Keep it short and point at the dashboard / ⚙ Settings.
+const WHATS_NEW: Record<string, string> = {
+  '2.2':
+    'what’s new —\n' +
+    '• Conversation viewer — re-read a past session read-only, without spending model context\n' +
+    '• Shareable usage card (themed)\n' +
+    '• Token heatmap you can publish to your GitHub profile\n' +
+    '• Sessions “Active time” column\n' +
+    '• Live-refresh delay control\n' +
+    '• Experimental insights — cache-churn bill, cache warmth by model, big one-shot turns, your active hours, skill ROI\n' +
+    'Most are opt-in — turn them on in ⚙ Settings (they show up on the Content / Sessions tabs).',
+};
 
 export class ClaudeCodeUsageExtension {
   private statusBar: StatusBarManager;
@@ -86,6 +106,9 @@ export class ClaudeCodeUsageExtension {
     // Migrate any pre-2.1 settings.json values for the keys that have moved out
     // of the VS Code Settings UI into the dashboard-managed store. Runs once.
     void this.settings.migrateOnce();
+    // V2.2: convert the old pauseDashboardRefresh to the positive
+    // dashboardAutoRefresh (inverted). Runs once.
+    void this.settings.migrateDashboardAutoRefresh();
     // Usage Optimizer (Phase 9c): the webview posts a draft prompt; we run it
     // through the same model backend as the advice feature and post back a
     // tightened prompt + a settings recommendation. Consent gate lives here.
@@ -102,14 +125,60 @@ export class ClaudeCodeUsageExtension {
     this.startAutoRefresh();
     this.refreshData().then(() => this.startFileWatching());
     this.startCredentialsWatching();
+    this.maybeAnnounceWhatsNew();
     console.log('Claude Code Usage Extension: Initialization complete');
+  }
+
+  /** After an upgrade, show a single "what's new" notification pointing at the
+   * dashboard — so users discover new features (including opt-in, default-off
+   * ones they'd never find otherwise). Shown once per version; skipped on a
+   * fresh install (no nagging new users). */
+  private maybeAnnounceWhatsNew(): void {
+    const current = (this.context.extension?.packageJSON?.version as string) || '';
+    const last = this.context.globalState.get<string>('ccu.lastSeenVersion');
+    if (!current || last === current) {
+      return;
+    }
+    void this.context.globalState.update('ccu.lastSeenVersion', current);
+    if (!last) {
+      return; // fresh install — don't interrupt
+    }
+    // Keyed by major.minor so patch releases don't re-nag.
+    const mm = current.split('.').slice(0, 2).join('.');
+    this.showWhatsNew(mm);
+  }
+
+  /** Show the what's-new toast for a given major.minor, if one exists. */
+  private showWhatsNew(mm: string): void {
+    const news = WHATS_NEW[mm];
+    if (!news) {
+      return;
+    }
+    const open = I18n.t.popup.title; // "Show details" entry point label
+    void vscode.window.showInformationMessage(`Claude Code Usage ${mm}: ${news}`, open).then((pick) => {
+      if (pick === open) {
+        vscode.commands.executeCommand('claudeCodeUsage.showDetails');
+      }
+    });
+  }
+
+  /** Force-show the newest what's-new entry, ignoring the once-per-version
+   * guard — for re-reading the announcement or testing it during development
+   * (a fresh F5 install otherwise just sets the baseline and shows nothing). */
+  private previewWhatsNew(): void {
+    const latest = Object.keys(WHATS_NEW).sort().pop();
+    if (latest) {
+      this.showWhatsNew(latest);
+    } else {
+      void vscode.window.showInformationMessage('No what’s-new entry yet.');
+    }
   }
 
   private setupCommands(): void {
     const commands = [
       vscode.commands.registerCommand('claudeCodeUsage.refresh', () => {
         // Manual refresh always updates the dashboard even when
-        // pauseDashboardRefresh is on.
+        // dashboardAutoRefresh is off.
         this.refreshData(true);
       }),
       vscode.commands.registerCommand('claudeCodeUsage.showDetails', () => {
@@ -126,6 +195,18 @@ export class ClaudeCodeUsageExtension {
       }),
       vscode.commands.registerCommand('claudeCodeUsage.showLogs', () => {
         this.outputChannel.show();
+      }),
+      vscode.commands.registerCommand('claudeCodeUsage.exportHeatmap', () => {
+        this.exportHeatmap();
+      }),
+      vscode.commands.registerCommand('claudeCodeUsage.publishHeatmapToGitHub', () => {
+        this.publishHeatmapToGitHub();
+      }),
+      vscode.commands.registerCommand('claudeCodeUsage.exportShareCard', () => {
+        this.exportShareCard();
+      }),
+      vscode.commands.registerCommand('claudeCodeUsage.previewWhatsNew', () => {
+        this.previewWhatsNew();
       })
     ];
 
@@ -142,6 +223,235 @@ export class ClaudeCodeUsageExtension {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       vscode.window.showErrorMessage(`${I18n.t.popup.pricingUpdateFailed}: ${message}`);
+    }
+  }
+
+  /** Export the token heatmap as a GitHub-profile-ready SVG (a "contribution
+   * graph" of the trailing year, Claude orange). Offers to copy the Markdown
+   * embed snippet. */
+  private async exportHeatmap(): Promise<void> {
+    const records = this.cache.records;
+    if (!records || records.length === 0) {
+      vscode.window.showWarningMessage(I18n.t.popup.noDataMessage);
+      return;
+    }
+    const daily = ClaudeDataLoader.getDailyUsageMap(records, I18n.getTimezone());
+    const svg = renderHeatmapSvg(daily);
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(path.join(os.homedir(), 'claude-code-heatmap.svg')),
+      filters: { 'SVG image': ['svg'] },
+      saveLabel: 'Export heatmap',
+    });
+    if (!uri) {
+      return;
+    }
+    try {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(svg, 'utf8'));
+    } catch (e) {
+      vscode.window.showErrorMessage(`Heatmap export failed: ${(e as Error).message}`);
+      return;
+    }
+    const copy = 'Copy Markdown embed';
+    const pick = await vscode.window.showInformationMessage('Token heatmap exported.', copy);
+    if (pick === copy) {
+      await vscode.env.clipboard.writeText(`![Claude Code token heatmap](${path.basename(uri.fsPath)})`);
+    }
+  }
+
+  /** Minimal GitHub REST call over https (the codebase avoids fetch for
+   * older-runtime safety). Returns the status + raw body. */
+  private githubApi(
+    method: string,
+    apiPath: string,
+    token: string,
+    body?: unknown
+  ): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const data = body ? JSON.stringify(body) : undefined;
+      const req = https.request(
+        {
+          hostname: 'api.github.com',
+          path: apiPath,
+          method,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github+json',
+            'User-Agent': 'ClaudeCodeUsage-VSCode',
+            'X-GitHub-Api-Version': '2022-11-28',
+            ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {}),
+          },
+          timeout: 20000,
+        },
+        (res) => {
+          let b = '';
+          res.on('data', (c) => (b += c));
+          res.on('end', () => resolve({ status: res.statusCode || 0, body: b }));
+        }
+      );
+      req.on('error', reject);
+      req.on('timeout', () => req.destroy(new Error('GitHub request timed out')));
+      if (data) {
+        req.write(data);
+      }
+      req.end();
+    });
+  }
+
+  /** Publish the token heatmap SVG to a GitHub repo (e.g. the user's profile
+   * repo, so it shows on their GitHub home) using VS Code's built-in GitHub
+   * auth — no PAT handling. Creates or updates the file via the Contents API. */
+  private async publishHeatmapToGitHub(): Promise<void> {
+    const records = this.cache.records;
+    if (!records || records.length === 0) {
+      vscode.window.showWarningMessage(I18n.t.popup.noDataMessage);
+      return;
+    }
+
+    // This is an authorization + write action, not a local export — make that
+    // explicit and get consent before touching GitHub.
+    const proceed = 'Sign in & publish';
+    const ok = await vscode.window.showWarningMessage(
+      'Publish the token heatmap to GitHub?',
+      {
+        modal: true,
+        detail:
+          'This signs you in to GitHub (VS Code asks once) and commits a single SVG image to a repo you choose (default: your profile repo, so it shows on your GitHub home). Only the aggregate heatmap is uploaded — never prompts, file paths, or session ids. You can delete it from the repo anytime.',
+      },
+      proceed
+    );
+    if (ok !== proceed) {
+      return;
+    }
+
+    let session: vscode.AuthenticationSession | undefined;
+    try {
+      // 'repo' so private profile repos work too; VS Code shows its own consent.
+      session = await vscode.authentication.getSession('github', ['repo'], { createIfNone: true });
+    } catch {
+      vscode.window.showErrorMessage('GitHub sign-in was cancelled.');
+      return;
+    }
+    if (!session) {
+      return;
+    }
+    const token = session.accessToken;
+    const login = session.account.label.split(/\s/)[0];
+
+    const repo = await vscode.window.showInputBox({
+      prompt: 'Target repo (owner/name). Your profile repo (name = username) shows the heatmap on your GitHub home page.',
+      value: this.context.globalState.get<string>('ccu.heatmapRepo') || `${login}/${login}`,
+      validateInput: (v) => (/^[^/\s]+\/[^/\s]+$/.test(v.trim()) ? undefined : 'Use the form owner/name'),
+    });
+    if (!repo) {
+      return;
+    }
+    const filePath =
+      (await vscode.window.showInputBox({
+        prompt: 'File path in the repo',
+        value: this.context.globalState.get<string>('ccu.heatmapPath') || 'claude-code-heatmap.svg',
+      })) || '';
+    if (!filePath) {
+      return;
+    }
+    await this.context.globalState.update('ccu.heatmapRepo', repo.trim());
+    await this.context.globalState.update('ccu.heatmapPath', filePath.trim());
+
+    const [owner, name] = repo.trim().split('/');
+    const svg = renderHeatmapSvg(ClaudeDataLoader.getDailyUsageMap(records, I18n.getTimezone()));
+    const contentB64 = Buffer.from(svg, 'utf8').toString('base64');
+    const apiPath = `/repos/${owner}/${name}/contents/${filePath.trim().split('/').map(encodeURIComponent).join('/')}`;
+
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Publishing heatmap to GitHub…' },
+        async () => {
+          // Look up the current sha (needed to update an existing file).
+          let sha: string | undefined;
+          const getRes = await this.githubApi('GET', apiPath, token);
+          if (getRes.status === 200) {
+            sha = JSON.parse(getRes.body).sha as string;
+          } else if (getRes.status !== 404) {
+            throw new Error(this.githubError(getRes));
+          }
+          const putRes = await this.githubApi('PUT', apiPath, token, {
+            message: 'Update Claude Code usage heatmap',
+            content: contentB64,
+            sha,
+          });
+          if (putRes.status !== 200 && putRes.status !== 201) {
+            throw new Error(this.githubError(putRes));
+          }
+        }
+      );
+    } catch (e) {
+      vscode.window.showErrorMessage(`Heatmap publish failed: ${(e as Error).message}`);
+      return;
+    }
+
+    const view = 'View on GitHub';
+    const pick = await vscode.window.showInformationMessage(
+      `Heatmap published to ${repo.trim()}.`,
+      view
+    );
+    if (pick === view) {
+      void vscode.env.openExternal(vscode.Uri.parse(`https://github.com/${owner}/${name}/blob/HEAD/${filePath.trim()}`));
+    }
+  }
+
+  /** Pull a human message out of a GitHub error response. */
+  private githubError(res: { status: number; body: string }): string {
+    try {
+      const msg = JSON.parse(res.body).message;
+      return `GitHub ${res.status}: ${msg || res.body.slice(0, 120)}`;
+    } catch {
+      return `GitHub ${res.status}`;
+    }
+  }
+
+  /** Export a one-page usage share card as a self-contained SVG. Only aggregate,
+   * non-identifying metrics are drawn (privacy is enforced by ShareCardData's
+   * shape). The user picks the range; the card opens for review after saving. */
+  private async exportShareCard(): Promise<void> {
+    const records = this.cache.records;
+    if (!records || records.length === 0) {
+      vscode.window.showWarningMessage(I18n.t.popup.noDataMessage);
+      return;
+    }
+    const ranges: (vscode.QuickPickItem & { range: ShareRange })[] = [
+      { label: 'This month', range: 'month' },
+      { label: 'Last 7 days', range: 'week' },
+      { label: 'Today', range: 'today' },
+    ];
+    const picked = await vscode.window.showQuickPick(ranges, {
+      placeHolder: 'Share card range',
+    });
+    if (!picked) {
+      return;
+    }
+    const input = ClaudeDataLoader.buildShareInput(records, picked.range);
+    const data = buildShareCardData(input, DEFAULT_SECTIONS);
+    const kind = vscode.window.activeColorTheme?.kind;
+    const isDark = kind === vscode.ColorThemeKind.Dark || kind === vscode.ColorThemeKind.HighContrast;
+    const svg = renderShareCardSvg(data, { theme: 'claudeClassic', isDark, lang: I18n.getLocale() });
+    const defaultName = shareCardFilename(picked.range).replace(/\.png$/, '.svg');
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(path.join(os.homedir(), defaultName)),
+      filters: { 'SVG image': ['svg'] },
+      saveLabel: 'Export share card',
+    });
+    if (!uri) {
+      return;
+    }
+    try {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(svg, 'utf8'));
+    } catch (e) {
+      vscode.window.showErrorMessage(`Share card export failed: ${(e as Error).message}`);
+      return;
+    }
+    const open = 'Open';
+    const pick = await vscode.window.showInformationMessage('Usage share card exported.', open);
+    if (pick === open) {
+      await vscode.commands.executeCommand('vscode.open', uri);
     }
   }
 
@@ -361,6 +671,7 @@ export class ClaudeCodeUsageExtension {
     const config = this.getConfiguration();
     I18n.setLanguage(config.language as any);
     I18n.setDecimalPlaces(config.decimalPlaces);
+    I18n.setTokenDecimalPlaces(config.tokenDecimalPlaces);
     I18n.setCompactNumbers(config.compactNumbers);
     I18n.setTimezone(config.timezone);
     this.statusBar.setVisibility(config.showCost, config.showContext, config.usageLimitTracking, config.statusBarMetric, config.showOpusWeekly, config.quotaFiveHourOnly, config.showResetInStatusBar);
@@ -395,6 +706,7 @@ export class ClaudeCodeUsageExtension {
       dataDirectory: s.get<string>('dataDirectory'),
       language: s.get<string>('language'),
       decimalPlaces: s.get<number>('decimalPlaces'),
+      tokenDecimalPlaces: s.get<number>('tokenDecimalPlaces'),
       compactNumbers: s.get<boolean>('compactNumbers'),
       timezone: s.get<string>('timezone'),
       showCost: s.get<boolean>('showCost'),
@@ -402,9 +714,9 @@ export class ClaudeCodeUsageExtension {
       contextWindowOverride: s.get<number>('contextWindowOverride'),
       statusBarMetric: s.get<'cost' | 'monthly-cost' | 'tokens'>('statusBarMetric'),
       showOpusWeekly: s.get<boolean>('showOpusWeekly'),
-      usageLimitTracking: s.get<boolean>('usageLimitTracking'),
-      quotaFiveHourOnly: s.get<boolean>('quotaFiveHourOnly'),
       showResetInStatusBar: s.get<boolean>('showResetInStatusBar'),
+      quotaFiveHourOnly: s.get<boolean>('quotaFiveHourOnly'),
+      usageLimitTracking: s.get<boolean>('usageLimitTracking'),
       adviceApiKey: s.get<string>('advice.apiKey'),
       adviceApiUrl: s.get<string>('advice.apiUrl'),
       adviceModel: s.get<string>('advice.model'),
@@ -419,8 +731,8 @@ export class ClaudeCodeUsageExtension {
       advicePromptWindowDays: s.get<number>('advice.promptWindowDays'),
       enableContentAnalysis: s.get<boolean>('enableContentAnalysis'),
       projectGroupingMode: s.get<'git' | 'folder' | 'flat'>('projectGroupingMode'),
-      fileWatching: s.get<boolean>('fileWatching'),
-      pauseDashboardRefresh: s.get<boolean>('pauseDashboardRefresh')
+      fileWatchSeconds: Number(s.get<string>('fileWatchSeconds') ?? '2') || 0,
+      dashboardAutoRefresh: s.get<boolean>('dashboardAutoRefresh')
     };
   }
 
@@ -448,6 +760,7 @@ export class ClaudeCodeUsageExtension {
     const config = this.getConfiguration();
     I18n.setLanguage(config.language as any);
     I18n.setDecimalPlaces(config.decimalPlaces);
+    I18n.setTokenDecimalPlaces(config.tokenDecimalPlaces);
     I18n.setCompactNumbers(config.compactNumbers);
     I18n.setTimezone(config.timezone);
     this.statusBar.setVisibility(config.showCost, config.showContext, config.usageLimitTracking, config.statusBarMetric, config.showOpusWeekly, config.quotaFiveHourOnly, config.showResetInStatusBar);
@@ -475,8 +788,8 @@ export class ClaudeCodeUsageExtension {
    */
   private async startFileWatching(): Promise<void> {
     const config = this.getConfiguration();
-    if (!config.fileWatching) {
-      this.stopFileWatching();
+    if (!(config.fileWatchSeconds > 0)) {
+      this.stopFileWatching(); // "Off"
       return;
     }
     const dataDirectory = await ClaudeDataLoader.findClaudeDataDirectory(config.dataDirectory || undefined);
@@ -504,7 +817,7 @@ export class ClaudeCodeUsageExtension {
         }
         this.watchDebounceTimer = setTimeout(() => {
           this.refreshData();
-        }, 1500);
+        }, config.fileWatchSeconds * 1000);
       });
       this.watchedDir = projectsDir;
     } catch {
@@ -715,11 +1028,11 @@ export class ClaudeCodeUsageExtension {
     this.isRefreshing = true;
     try {
       const config = this.getConfiguration();
-      // When the user has paused dashboard refresh, auto-triggers (timer +
-      // fs.watch) skip the webview update entirely; the status bar still
-      // refreshes so today's cost / quota stay live. Manual command always
-      // refreshes everything so the user can force-update on demand.
-      const updateWebview = manualTrigger || !config.pauseDashboardRefresh;
+      // When dashboard auto-refresh is off, auto-triggers (timer + fs.watch)
+      // skip the webview update entirely; the status bar still refreshes so
+      // today's cost / quota stay live. Manual command always refreshes
+      // everything so the user can force-update on demand.
+      const updateWebview = manualTrigger || config.dashboardAutoRefresh;
 
       // Quota is account-level, decoupled from local data. Fire it without
       // awaiting so a slow/cold OAuth fetch (curl can take seconds, or fail
@@ -835,6 +1148,7 @@ export class ClaudeCodeUsageExtension {
       const projectBreakdown = ClaudeDataLoader.getProjectBreakdown(records, undefined, config.projectGroupingMode);
       const branchBreakdown = ClaudeDataLoader.getBranchBreakdown(records);
       const workflowBreakdown = ClaudeDataLoader.getWorkflowBreakdown(records);
+      const costliestMessages = ClaudeDataLoader.getCostliestMessages(records);
 
       // Update UI. Quota is pushed asynchronously by the fire-and-forget fetch
       // above; passing undefined leaves the quota item untouched here.
@@ -843,7 +1157,7 @@ export class ClaudeCodeUsageExtension {
         ClaudeDataLoader.getCurrentContextInfo(records, workspacePath, config.contextWindowOverride)
       );
       if (updateWebview) {
-        this.webviewProvider.updateData(sessionData, todayData, monthData, allTimeData, dailyDataForMonth, dailyDataForAllTime, hourlyDataForToday, undefined, dataDirectory, records, sessionBreakdown, projectBreakdown, contentAnalysis, branchBreakdown, workflowBreakdown);
+        this.webviewProvider.updateData(sessionData, todayData, monthData, allTimeData, dailyDataForMonth, dailyDataForAllTime, hourlyDataForToday, undefined, dataDirectory, records, sessionBreakdown, projectBreakdown, contentAnalysis, branchBreakdown, workflowBreakdown, costliestMessages);
       }
 
     } catch (error) {
@@ -852,7 +1166,7 @@ export class ClaudeCodeUsageExtension {
 
       this.statusBar.updateUsageData(null, null, errorMessage);
       this.statusBar.updateContext(null);
-      if (manualTrigger || !this.getConfiguration().pauseDashboardRefresh) {
+      if (manualTrigger || this.getConfiguration().dashboardAutoRefresh) {
         this.webviewProvider.updateData(null, null, null, null, [], [], [], errorMessage, null);
       }
     } finally {

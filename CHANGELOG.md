@@ -4,7 +4,151 @@ All notable changes to this fork compared to upstream
 [`ClaudeCodeUsage/ClaudeCodeUsage`](https://github.com/ClaudeCodeUsage/ClaudeCodeUsage) (last
 upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased]
+## [2.2.0] — Unreleased
+
+### Added
+- **`tokenDecimalPlaces`** (default 1, 0–2) — decimals for the *compact* token
+  display (`1.2M` / `345.6K`); full integer counts are unaffected.
+- **Cache-hit-rate column** in the All-time (monthly) and This-month (daily)
+  breakdown tables — and in the expanded per-day / per-hour drill-downs — so the
+  cache efficiency is visible per row, not just in the summary card.
+- **Token heatmap on the All tab** (opt-in, `showHeatmap`, default off) — a
+  GitHub-style yearly token heatmap (Claude orange) at the top of the All tab.
+  Inline SVG, so the per-day hover tooltips work in the dashboard. Mainly a
+  shareable view of data already shown elsewhere, hence off by default.
+- **Export Token Heatmap (GitHub style)** — a command that writes a
+  self-contained, GitHub-contribution-style SVG of the trailing year's token
+  usage (Claude-orange scale, top-left summary, per-day tooltips, source
+  watermark) to a file, with a one-click "copy Markdown embed" — for pasting
+  into a GitHub profile README. Pure, unit-tested renderer (`heatmapSvg.ts`).
+- **Token-composition drill-down** — clicking a month in the All-time *Token
+  composition* chart expands that month's per-day composition (alongside the
+  daily chart + table), so you can read the input / output / cache-write /
+  cache-read split day by day, not just at the month level.
+- **Share-card + heatmap foundations** — tested pure logic (`src/shareCard.ts`,
+  `src/heatmap.ts`) for the upcoming Usage Share Card and Monthly token heatmap.
+
+- **Efficiency insights** (opt-in, `showEfficiency`, default off) — starts with a
+  **top-10 costliest conversations** panel on the Content tab: expandable rows
+  (native disclosure) showing each session's tokens, cache-hit rate, top model
+  and project, ranked by cost. (Cost-per-message + realised cache-savings chips
+  on Today/projects use the same toggle.)
+- **"What's new" prompt after upgrades** — a single, dismissible notification
+  the first time you run a new major.minor version, pointing at the dashboard so
+  new (including opt-in, default-off) features are discoverable. Shown once per
+  version; skipped on a fresh install.
+- **Usage Share Card** (opt-in, `enableShareCard`, default off) — a configurable
+  one-page SVG you can generate and export/share: pick a range (last 30 days /
+  week / month / year / a specific month), a scope (overall / a project / a
+  session), which metrics to show, and a **theme** — **Claude Classic** (orange,
+  default), **Claude Cream**, **Aurora Dark**, or **Auto**. Self-contained SVG;
+  optional GitHub **avatar + name**; deterministic; privacy by construction (no
+  prompts/paths/ids). Built on demand; config + preview survive a refresh.
+- **Publish Token Heatmap to GitHub** — one-click publish of the heatmap SVG to
+  a repo (default: your profile repo) via VS Code's built-in GitHub auth (no
+  PAT). Shows a consent modal first.
+- **Top-10 costliest *messages*** (opt-in, `showCostliestMessages`, default off,
+  Content tab) — ranks single turns by cost; expand for the triggering prompt,
+  model, skill, a **cost split** that distinguishes a **cache miss** from a long
+  answer, the **cache-hit rate**, and the **time since the last turn** (+ a
+  "model switch flushed the cache" / "idle past cache TTL" cause). (Reworked from
+  the earlier costliest-*conversations* panel.)
+- **Cache warmth estimate** (`showEfficiency`) — infers how long your prompt
+  cache stays warm while idle from your own turns (measured **~60 min**, not 5).
+- **Efficiency chips** — cost/message, **tokens/message**, realised cache savings
+  on Today / month / all-time; a **Cost/msg** column in the projects table.
+- **Conversation viewer** (opt-in, `showConversationViewer`, **default on** — it's
+  read-only) — a "view" button on the Sessions tab opens a read-only reader for a
+  past conversation: your prompts up front, the model's answers rendered from
+  Markdown (tables included), with thinking and tool traffic behind toggles. Lets
+  you re-read a session to jog your memory *without* loading it back into the
+  model's context (unlike resume). Reads local logs only; refreshes each time you
+  open it; loads the last 10 rounds.
+- **Experimental insights** (opt-in, `showInsights`, default off, Content tab) —
+  heuristic estimates from your local logs, labelled as estimates: a **cache-churn
+  bill** ($ spent re-writing cache after model switches / idle gaps), **cache
+  warmth by model** (how long each model keeps your cache warm), **big one-shot
+  turns** (a checkpoint nudge), **your active hours** (a 24-h token sparkline +
+  peak window), and **skill ROI** (output tokens returned per $ per skill/plugin).
+- **Sessions "Active" column** — estimated hands-on time per session (gaps between
+  turns, each idle gap capped at 1.5 h), which is far more meaningful than the raw
+  first-to-last span for long-lived sessions. Sortable, with an explanatory tooltip.
+- **Live-refresh delay control** (`fileWatchSeconds`: Off / 1 / 2 / 5 / 10 / 20 /
+  30 s, default 2 s) replaces the on/off "live file watching" toggle. This only
+  re-reads your **local** log files — no API call; the `/usage` quota fetch is
+  throttled separately.
+- **Chinese share-card units** — the share card uses 万/亿 (萬/億 in zh-TW) and its
+  text follows the UI language, so an English card is fully English and a Chinese
+  card fully Chinese.
+
+### Changed
+- **`enableSessionActions`** (default off) gates the Sessions **resume _and_
+  delete** buttons together — both *act* on your Claude Code (reopen / trash a
+  log), at odds with the extension being read-only, so they're opt-in as a pair.
+  (Replaces the earlier `enableSessionDelete`.)
+- **Timezone-aware bucketing** — every Today / day / month / hour total now derives
+  its day boundary from the configured IANA zone (empty = system), kept in lockstep
+  with the display, so the aggregations agree with each other and with the console;
+  an invalid zone falls back to the system zone instead of breaking the dashboard.
+- **Cache-write cost by TTL** — when a log carries the cache-creation TTL split, a
+  1-hour cache write is priced at 2× base input (vs the 5-minute 1.25×), matching
+  Anthropic's billing; logs without the split are unchanged. (PR #62, @zeyutang.)
+- **Timezone dropdown = full UTC-offset coverage** — common zones plus every UTC
+  offset (grouped Common / UTC offset), each labelled with its current offset;
+  IANA identifiers only (no editorialised place names).
+- **`dashboardAutoRefresh`** (positive wording, default true) replaces the
+  double-negative `pauseDashboardRefresh`; existing values are migrated.
+- Repository metadata (`repository` / `bugs` / `homepage`) now points at the
+  `ClaudeCodeUsage` organization.
+
+### Fixed
+- **Thinking share reads "hidden", not a false 0%,** for models that omit their
+  reasoning text (Fable 5 / Opus 4.8 — `"thinking":""` + a signature).
+- **Quota reset countdown** in the tooltip now reads `4d 12h` (the compact
+  status-bar form keeps `4.5d`); a recently-expired usage-anchored window no
+  longer shows a fabricated countdown while idle.
+- **Auto-refresh no longer wipes** the generated share card or collapses expanded
+  Content rows (reset only on tab switch); the GitHub avatar renders (webview CSP
+  now allows `data:` images).
+- Message counts exclude api_error retries and the compaction summary line.
+- **Timezone is a validated dropdown** — the Timezone setting is now a picker of
+  valid IANA zones (`Intl.supportedValuesOf`) instead of free text, so an invalid
+  value can't be entered; a guard also rejects any old bad synced value. Fixes a
+  crash where a hand-typed zone made `Intl` throw and broke the whole dashboard.
+  (#51)
+- **German (de-DE) now selectable** — the German translation (contributed by
+  @mxzinke) existed in the strings and `SupportedLanguage` but had never been
+  added to the `package.json` enum or the settings dropdown, so it couldn't be
+  chosen. Exposed it everywhere; verified the translation and fixed two English
+  leaks (`error`, popup `currentSession`).
+- **pt-BR now selectable** — Brazilian Portuguese (added in 2.1.1) was missing
+  from the dashboard's language dropdown (`settings.ts` enum) and the README
+  language lists, even though the strings, `package.json` enum and
+  `SupportedLanguage` already had it. Wired it through everywhere.
+- **Timezone-correct month / day bucketing** — the This-month and All-time
+  breakdowns now bucket every record's day *and* month in the configured
+  timezone (empty = system). Previously the month boundary was local while the
+  day key was UTC, so a record just after local midnight on the 1st showed up
+  under the previous month's last day. (`src/dateKeys.ts`, unit-tested.)
+- **Breakdown table scroll** — number cells stay on one line, so the compact
+  (k/M) view fits the panel with no horizontal scroll while full integer numbers
+  overflow and scroll the table only; the chart keeps its own scroll.
+- **API-error retries no longer inflate the Messages count** — when a request
+  errors, Claude Code retries it and re-logs the same user prompt; an identical
+  prompt re-appearing within a short window is now counted once (genuine
+  re-sends minutes/hours later still count). (`src/promptDedup.ts`, unit-tested.)
+- **Compaction summary no longer counts as a message** — when a session is
+  auto-compacted, Claude Code injects the "This session is being continued…"
+  summary as a *user* message; it's now excluded from the Messages count (you
+  never typed it). Verified on real logs.
+- **Cache-write ("input cache miss") bars render again** — in every usage bar
+  chart, selecting the cache-write metric showed only the axis and value labels:
+  the bar's gradient referenced a `--vscode-charts-pink` colour VS Code doesn't
+  define, which made the whole gradient invalid (transparent). Added a fallback.
+
+### Removed
+- Dropped the unused `@types/glob` devDependency (clears a vulnerability
+  advisory). Thanks @zeyutang (#63).
 
 ### Fixed
 - **Sonnet 5 context window** — `contextWindowFor()` only recognised the 1M

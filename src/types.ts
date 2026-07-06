@@ -37,6 +37,9 @@ export interface ClaudeUsageRecord {
   // Synthetic marker record for one genuine user prompt (zero usage).
   // messageCount counts these, so "Messages" means what users typed.
   _isUserPrompt?: boolean;
+  // Truncated text of a user prompt (only on _isUserPrompt records) — lets the
+  // "costliest messages" panel show what triggered an expensive turn.
+  _promptText?: string;
   // --- Sub-agent attribution (set when the source file sits under a
   // `subagents/` directory; see V2.1-WORKFLOW-SPEC §2) ---
   // Workflow run id ("wf_…") when the file sits under subagents/workflows/.
@@ -104,6 +107,40 @@ export interface SessionUsage {
   peakContextTokens: number;
 }
 
+// One expensive assistant turn, for the Content tab's "costliest messages"
+// panel. A single billed response, with the user prompt that triggered it and
+// the skill/plugin/model in play — so a costly turn can be understood, not just
+// counted. (Content-analysis theme, alongside AI advice + the optimizer.)
+export interface CostlyMessage {
+  timestamp: string;
+  cost: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  // Cost split by token type (sums to cost) — lets the panel show *why* a turn
+  // was expensive: fresh cache writes / cache miss vs. long output vs. cheap
+  // cache reads. costCacheWrite dominating = a cache miss, not a big answer.
+  costInput: number;
+  costOutput: number;
+  costCacheWrite: number;
+  costCacheRead: number;
+  model: string; // full model id (e.g. "claude-opus-4-8"), not a family
+  skill?: string;
+  plugin?: string;
+  prompt?: string; // truncated text of the triggering user prompt
+  projectName: string;
+  sessionId: string;
+  // Gap since the previous billable turn in the same session (ms). undefined =
+  // this was the session's first turn (a new conversation). A gap past the
+  // cache TTL is a strong cache-miss signal — pairs with the low cache-hit rate.
+  gapMs?: number;
+  // The previous billable turn's model (same session). If it differs from
+  // `model`, the switch flushed the (per-model) cache — another cache-miss
+  // cause distinct from an idle gap. undefined on a session's first turn.
+  prevModel?: string;
+}
+
 // Per-project breakdown: usage aggregated across every session of a project.
 export interface ProjectUsage {
   projectName: string;
@@ -142,6 +179,10 @@ export interface ContentSlice {
 export interface ThinkingShare {
   thinking: number;
   assistantTotal: number;
+  // True when a thinking block was present but its text was empty (raw CoT not
+  // exposed — Fable 5, Opus 4.8 default). We know thinking happened but can't
+  // size it, so the UI shows "hidden" rather than a misleading 0%.
+  hiddenThinking?: boolean;
 }
 
 // One skill / slash-command invocation, detected in the logs (assistant
@@ -226,6 +267,8 @@ export interface ExtensionConfig {
   dataDirectory: string;
   language: string;
   decimalPlaces: number;
+  // Decimals for compact token display only (1.2M / 345.6K).
+  tokenDecimalPlaces: number;
   compactNumbers: boolean;
   // IANA timezone name (e.g. "Asia/Hong_Kong") used for date display, or ''
   // to use the system timezone. Useful for users in devcontainers or
@@ -241,12 +284,11 @@ export interface ExtensionConfig {
   statusBarMetric: 'cost' | 'monthly-cost' | 'tokens';
   // Opt-in: append the weekly Opus limit (opus:NN%) to the quota item (PR #38).
   showOpusWeekly: boolean;
+  // Quota status-bar display (V2.2): inline reset countdown; 5h-only.
+  showResetInStatusBar: boolean;
+  quotaFiveHourOnly: boolean;
   // Fetch real 5-hour / weekly limit utilisation via Claude Code's OAuth session.
   usageLimitTracking: boolean;
-  // Show only the 5-hour quota window (hide weekly / Opus).
-  quotaFiveHourOnly: boolean;
-  // Append the reset countdown to the status-bar quota item.
-  showResetInStatusBar: boolean;
   // LLM "usage advice" feature (OpenAI-compatible endpoint, e.g. DeepSeek).
   adviceApiKey: string;
   adviceApiUrl: string;
@@ -272,14 +314,14 @@ export interface ExtensionConfig {
   //   - 'folder' group by the heuristic top-level project folder only
   //   - 'flat'   no grouping; every working directory is its own row
   projectGroupingMode: 'git' | 'folder' | 'flat';
-  // Watch log files and refresh within ~1.5s of each new message. When false
-  // the extension falls back to the interval-based refresh, which is calmer
-  // but lags behind real-time.
-  fileWatching: boolean;
+  // Live refresh delay (seconds) after new activity in the LOCAL log files.
+  // 0 = off (fall back to the interval-based refresh). Values: 0/1/2/5/10/20/30.
+  // Only re-reads local files — the /usage quota fetch is throttled separately.
+  fileWatchSeconds: number;
   // Skip the dashboard webview on auto-refreshes (status bar still updates).
   // Use when the constantly-reloading dashboard interferes with reading
   // numbers while an agent is actively writing.
-  pauseDashboardRefresh: boolean;
+  dashboardAutoRefresh: boolean;
 }
 
 export interface ModelPricing {

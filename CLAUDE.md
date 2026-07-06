@@ -38,7 +38,10 @@ billing tool, not a multi-provider monitor.
   rejects Node's TLS fingerprint.
 - **`advisor.ts`** + **`adviceDemoSample.ts`** — the opt-in AI advice feature
   and its localised static demo.
-- **`i18n.ts`** — translations for en / de-DE / zh-TW / zh-CN / ja / ko.
+- **`i18n.ts`** — translations for, and selectable UI languages (package.json
+  enum + settings dropdown), all seven: en / de-DE / zh-TW / zh-CN / ja / ko /
+  pt-BR. Keep the three in sync when adding a language: `SupportedLanguage`
+  (types.ts), the `package.json` enum, and `settings.ts` `enumValues`.
 - **`types.ts`** — shared interfaces.
 
 ## Build & Release
@@ -71,8 +74,11 @@ npx @vscode/vsce package   # build a .vsix
   of "fix the previous fix" commits. RC branches squash-merge to `main`.
 - **Tests:** a `node:test` suite runs against compiled output (`npm test`; see
   `src/test/` and CONTRIBUTING). Pure-logic modules (pricing, aggregation,
-  quota-window handling, i18n) are the high-value targets; `pricing.ts` has the
-  first coverage, the rest are still open.
+  timezone/date keys, dedup, share-card, heatmap, conversation-log, mini-markdown)
+  are the high-value targets and now carry most of the coverage. **One concern per
+  test file, named `camelCase.test.ts`** to match the module (e.g. `pricing.test.ts`,
+  `dateKeys.test.ts`) — don't add dotted `x.y.test.ts` files; fold new cases into
+  the existing file for that area.
 - **Data is read-only:** the extension never writes to `~/.claude/`.
 
 ## Documentation Maintenance
